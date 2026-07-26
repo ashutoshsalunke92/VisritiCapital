@@ -1,17 +1,14 @@
 """
-Broker-agnostic Hedged 25-Delta Strangle position state. Same spirit as
-strategy.py's IronFlyState — knows nothing about the broker/backtest/live
-distinction, just takes ticks and tells you what to do.
+Broker-agnostic Short Strangle Hedged position state.
 
-CHANGES IN THIS REVISION (see TUNING_GUIDE_V2.md):
-  - current_strikes(): returns the LIVE open strike per leg name. Previously
-    the adjustment engine was handed a fixed entry_ce_strike/entry_pe_strike
-    that never updated after a roll, so delta monitoring went stale the
-    moment the first adjustment fired. trading_engine.py now calls this every
-    tick instead of tracking its own (stale) copy.
-  - Trailing SL, identical mechanics to IronFlyState's (see strategy.py) but
-    measured against capital_deployed instead of net_credit, matching this
-    strategy's existing capital-based SL/TP convention.
+CHANGE IN THIS REVISION:
+  SL/TP decision logic delegated to exit_engine/ (same as strategy.py).
+  StrangleState now owns only leg tracking, P&L accounting, and roll
+  bookkeeping. The on_tick() method is retained for backward compat but
+  the primary tick path (trading_engine.py) uses the exit engine instead.
+
+  current_strikes() is still called every tick by the adjustment engine to
+  get live open strikes — this is unchanged and correct.
 """
 from dataclasses import dataclass, field
 from enum import Enum
@@ -50,8 +47,10 @@ class LegFill:
 
 
 LEG_NAMES = ["ce_short", "pe_short", "ce_hedge", "pe_hedge"]
-_SIDE_FOR = {"ce_short": Side.SELL, "pe_short": Side.SELL,
-             "ce_hedge": Side.BUY, "pe_hedge": Side.BUY}
+_SIDE_FOR = {
+    "ce_short": Side.SELL, "pe_short": Side.SELL,
+    "ce_hedge": Side.BUY,  "pe_hedge": Side.BUY,
+}
 
 
 @dataclass
@@ -60,7 +59,8 @@ class StrangleState:
     strategy_sl_capital_pct: float
     strategy_tp_capital_pct: float
     capital_deployed: float
-    # --- NEW: trailing SL, same switch as the Iron Fly's (config.py SL_MODE) ---
+    # Legacy trailing SL fields — retained for backward compatibility only.
+    # Actual trailing logic now lives in exit_engine/policies.py.
     sl_mode: str = "STATIC"
     trail_activate_pct: float = 0.5
     trail_giveback_pct: float = 0.3
@@ -79,20 +79,27 @@ class StrangleState:
         self.events.append({"ts": ts, "type": kind, "msg": msg})
 
     def enter(self, legs: dict, ts):
+        """legs: {'ce_short': premium, 'pe_short': premium, ...}"""
         for name in LEG_NAMES:
             premium = legs[name]
-            fill = LegFill(strike=None, side=_SIDE_FOR[name], quantity=self.quantity,
-                            entry_price=premium, entry_ts=ts)
+            fill = LegFill(
+                strike=None, side=_SIDE_FOR[name], quantity=self.quantity,
+                entry_price=premium, entry_ts=ts,
+            )
             self.fills[name] = [fill]
-        credit = (self.fills["ce_short"][0].entry_price + self.fills["pe_short"][0].entry_price
-                  - self.fills["ce_hedge"][0].entry_price - self.fills["pe_hedge"][0].entry_price) * self.quantity
+        credit = (
+            self.fills["ce_short"][0].entry_price + self.fills["pe_short"][0].entry_price
+            - self.fills["ce_hedge"][0].entry_price - self.fills["pe_hedge"][0].entry_price
+        ) * self.quantity
         self.net_credit = credit
         self.entered = True
         self._log(ts, "ENTRY", f"Net credit = {credit:.2f}")
 
     def open_leg_fill(self, name: str, strike: float, premium: float, ts):
-        fill = LegFill(strike=strike, side=_SIDE_FOR[name], quantity=self.quantity,
-                        entry_price=premium, entry_ts=ts)
+        fill = LegFill(
+            strike=strike, side=_SIDE_FOR[name], quantity=self.quantity,
+            entry_price=premium, entry_ts=ts,
+        )
         self.fills[name].append(fill)
         self._log(ts, "OPEN_LEG", f"{name} opened @ strike={strike} premium={premium:.2f}")
 
@@ -103,16 +110,15 @@ class StrangleState:
         return None
 
     def current_strikes(self) -> dict:
-        """NEW — live strike per leg name for whatever is currently open.
-        This is what the adjustment engine must watch, not the strikes the
-        position entered with (those go stale after the first roll)."""
-        out = {}
-        for name in LEG_NAMES:
-            f = self._open_fill(name)
-            out[name] = f.strike if f is not None else None
-        return out
+        """Returns the LIVE open strike per leg. Called every tick by the
+        adjustment engine so it always watches the current strike, not the
+        stale entry strike (which changes after a roll)."""
+        return {name: (self._open_fill(name).strike if self._open_fill(name) else None)
+                for name in LEG_NAMES}
 
     def close_leg(self, name: str, price: float, reason: str, ts):
+        """Close one leg — called by the tick driver after the exit engine
+        returns a LegDecision, or by force_exit logic."""
         f = self._open_fill(name)
         if f is None:
             return
@@ -122,8 +128,18 @@ class StrangleState:
         f.is_open = False
         self._log(ts, "EXIT_LEG", f"{name} closed @ {price:.2f} ({reason})")
 
+    def close_all(self, marks: dict, reason: str, ts):
+        """Close every open leg — called after the exit engine returns
+        close_entire_trade=True."""
+        for name in self.open_legs():
+            self.close_leg(name, marks[name], reason, ts)
+        self.closed = True
+        self.close_reason = reason
+
     def roll_leg(self, name: str, close_price: float, new_strike: float,
                  new_premium: float, reason: str, ts):
+        """Close the current fill and open a replacement at a new strike.
+        Called by the adjustment engine via trading_engine.py."""
         self.close_leg(name, close_price, reason, ts)
         self.open_leg_fill(name, new_strike, new_premium, ts)
         self.adjustment_count += 1
@@ -142,14 +158,14 @@ class StrangleState:
         return total
 
     def total_realized_pnl(self) -> float:
-        total = 0.0
-        for name in LEG_NAMES:
-            for f in self.fills[name]:
-                total += f.realized_pnl()
-        return total
+        return sum(f.realized_pnl() for fills in self.fills.values() for f in fills)
 
     def on_tick(self, ts, marks: dict, force_exit: bool = False,
                 exit_reason: str = "TIME_EXIT"):
+        """Retained for backward compat with code that calls this directly
+        (e.g. the legacy CLI scripts). The primary tick path in trading_engine
+        uses the exit engine instead and calls close_leg / close_all directly.
+        """
         if not self.entered or self.closed:
             return []
 
@@ -166,7 +182,6 @@ class StrangleState:
         sl_threshold = -abs(self.capital_deployed) * self.strategy_sl_capital_pct
         tp_threshold = abs(self.capital_deployed) * self.strategy_tp_capital_pct
 
-        # Hard SL first, in both modes.
         if pnl <= sl_threshold:
             for name in self.open_legs():
                 self.close_leg(name, marks[name], "STRATEGY_SL", ts)

@@ -1,0 +1,19 @@
+# Short Strangle Hedged — MONTHLY POSITIONAL Exit Policy
+# Capital-based SL/TP per the PDF Section 1 matrix: SL=4%, TP=8% of ₹2.5L allocation.
+# The Adjustment Engine (adjustment_engine.py) runs ahead of this SL — the 4% SL
+# is the final backstop regardless of adjustment state, per PDF Section 8.4.
+
+trade_level:
+  enabled: true
+  threshold:
+    trigger_source: LIVE_PNL
+    exit_type: PERCENTAGE
+    basis_source: CAPITAL_ALLOCATED
+    sl_value: 0.04                     # -4% of capital = -₹10,000 (hard backstop)
+    tp_value: 0.08                     # +8% of capital = +₹20,000
+    trailing_enabled: false
+    trail_activate_value: 0.04
+    trail_giveback_pct: 0.30
+
+leg_level:
+  enabled: false

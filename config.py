@@ -209,7 +209,7 @@ def load_strangle_params() -> StrangleParams:
         lots=_get("STRANGLE_LOTS", "1", int),
         strike_step=_get("STRIKE_STEP", "50", int),
         capital_deployed=_get("STRANGLE_CAPITAL", "250000", float),
-        short_leg_target_delta=_get("STRANGLE_SHORT_DELTA", "25.0", float),
+        short_leg_target_delta=_get("STRANGLE_SHORT_DELTA", "15.0", float),
         delta_tolerance=_get("STRANGLE_DELTA_TOLERANCE", "3.0", float),
         hedge_target_delta=_get("STRANGLE_HEDGE_DELTA", "5.0", float),
         hedge_fallback_points=_get("STRANGLE_HEDGE_FALLBACK_PTS", "350.0", float),
@@ -265,3 +265,41 @@ def load_session_defaults() -> SessionDefaults:
         output_dir=_get("OUTPUT_DIR", "output"),
         fixed_capital=_get("FIXED_CAPITAL", "250000", float),
     )
+
+
+# =========================================================================
+# Exit Engine policy paths — one YAML file per strategy × timeframe.
+# Default paths point at config/ in this project directory.
+# Override in .env if you want to keep policies elsewhere.
+# =========================================================================
+
+def load_exit_policy_paths() -> dict:
+    """Returns a dict keyed by 'strategy_timeframe' -> YAML file path.
+    trading_engine.py calls this to find the right policy for each run."""
+    _config_dir = os.path.join(_THIS_DIR, "config")
+    return {
+        "iron_fly_intraday": _get(
+            "EXIT_POLICY_IRONFLY_INTRADAY",
+            os.path.join(_config_dir, "iron_fly_exit_policy.yaml"),
+        ),
+        "iron_fly_weekly": _get(
+            "EXIT_POLICY_IRONFLY_WEEKLY",
+            os.path.join(_config_dir, "iron_fly_exit_policy.yaml"),
+        ),
+        "iron_fly_monthly": _get(
+            "EXIT_POLICY_IRONFLY_MONTHLY",
+            os.path.join(_config_dir, "iron_fly_exit_policy.yaml"),
+        ),
+        "strangle_intraday": _get(
+            "EXIT_POLICY_STRANGLE_INTRADAY",
+            os.path.join(_config_dir, "strangle_intraday_exit_policy.yaml"),
+        ),
+        "strangle_weekly": _get(
+            "EXIT_POLICY_STRANGLE_WEEKLY",
+            os.path.join(_config_dir, "strangle_weekly_exit_policy.yaml"),
+        ),
+        "strangle_monthly": _get(
+            "EXIT_POLICY_STRANGLE_MONTHLY",
+            os.path.join(_config_dir, "strangle_monthly_exit_policy.yaml"),
+        ),
+    }

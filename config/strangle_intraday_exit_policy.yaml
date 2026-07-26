@@ -1,0 +1,18 @@
+# Short Strangle Hedged — INTRADAY Exit Policy
+# Capital-based SL/TP per the PDF Section 1 matrix: SL=1%, TP=2% of ₹2.5L allocation.
+# Hedge legs (ce_hedge, pe_hedge) are never per-leg stopped.
+
+trade_level:
+  enabled: true
+  threshold:
+    trigger_source: LIVE_PNL
+    exit_type: PERCENTAGE
+    basis_source: CAPITAL_ALLOCATED    # threshold = % of ₹2.5L capital deployed
+    sl_value: 0.01                     # exit if PnL drops below -1% of capital (₹2,500)
+    tp_value: 0.02                     # exit if PnL reaches +2% of capital (₹5,000)
+    trailing_enabled: false
+    trail_activate_value: 0.01         # arm trailing once PnL >= 1% of capital
+    trail_giveback_pct: 0.30
+
+leg_level:
+  enabled: false    # no per-leg SL for the strangle — trade-level only

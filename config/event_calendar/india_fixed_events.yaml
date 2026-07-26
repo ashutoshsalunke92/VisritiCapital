@@ -1,0 +1,41 @@
+# India Fixed High-Impact Events Calendar
+# Maintain once or twice a year. RBI publishes its full MPC calendar in advance.
+# Format: date: "YYYY-MM-DD"  impact: HIGH | MEDIUM
+
+fixed_events:
+  - name: "Union Budget 2026"
+    date: "2026-02-01"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2025-08-06"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2025-10-08"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2025-12-05"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2026-02-06"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2026-04-09"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2026-06-05"
+    impact: HIGH
+
+  - name: "RBI MPC Decision"
+    date: "2026-08-06"
+    impact: HIGH
+
+  # Add future RBI MPC dates below as announced:
+  # - name: "RBI MPC Decision"
+  #   date: "2026-10-07"
+  #   impact: HIGH

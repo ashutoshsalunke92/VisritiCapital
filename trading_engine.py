@@ -1,32 +1,15 @@
 """
-Ties every module together and is what menu.py calls. One RunConfig, one
-run_session() entrypoint, dispatches by strategy x mode x timeframe.
+Ties every module together. One RunConfig, one run_session() entrypoint.
 
-FIXES IN THIS REVISION (see TUNING_GUIDE_V2.md for the full writeup):
-  #3  No date prompts. Backtest/forward-test always use a fixed rolling
-      window (BACKTEST_WINDOW_DAYS in .env/config.py, default 180 days back
-      from today) unless date_from/date_to are explicitly passed in (kept
-      as optional RunConfig fields for future CLI/API use -- the *menu*
-      never asks for them anymore).
-  #4  out_dir is always "output" -- RunConfig.out_dir is no longer surfaced
-      by the menu.
-  #5  capital is always ₹250,000 per runner (RunConfig.capital defaults from
-      config.load_session_defaults().fixed_capital) -- no longer surfaced by
-      the menu.
-  #6  Iron Condor monthly is now genuinely different from weekly: separate
-      non-overlapping entry/exit cycles (exit = monthly expiry minus
-      IRON_CONDOR_MONTHLY_EXIT_DAYS_BEFORE_EXPIRY, default 14 days) and its
-      own SL/TP thresholds (StrategyParams.resolved_monthly_sl_pct/tp_pct,
-      default 2x the weekly ones). The underlying data_fetcher.py /
-      strategy.py / backtest_engine.py are completely untouched -- only the
-      entry/exit DATES and the SL/TP params passed in differ.
-  #7  Strangle chain building now goes through the fixed strangle_data_fetcher
-      (correct next-weekly skip, bounded strike window, day-level caching,
-      logged real-data provenance) -- see that module's docstring.
-  #8  Forward-test now runs against REAL LIVE market data (live_data_source.py
-      for Iron Fly, strangle_data_fetcher.fetch_live_chain for the Strangle),
-      with orders simulated (never placed) -- not a historical replay
-      relabeled as "forward test".
+CHANGE IN THIS REVISION:
+  Exit engine (exit_engine/) is now constructed here for both strategies
+  and passed into the tick loop. Each strategy×timeframe loads its own
+  YAML policy file (config/iron_fly_exit_policy.yaml etc.) so thresholds
+  are fully config-driven with no hardcoded numbers anywhere in this file.
+
+  The path to each policy YAML is read from config.py (EXIT_POLICY_* env
+  vars, with sensible defaults pointing at config/). All other fixes from
+  TUNING_GUIDE_V2.md (#3-#8) are preserved unchanged.
 """
 import os
 from dataclasses import dataclass, replace
@@ -35,7 +18,8 @@ from typing import Optional
 import pandas as pd
 
 from config import (load_upstox_creds, load_strategy_params, load_strangle_params,
-                     load_session_defaults, StrategyParams, StrangleParams, StrangleTimeframe)
+                     load_session_defaults, StrategyParams, StrangleParams, StrangleTimeframe,
+                     load_exit_policy_paths)
 from upstox_client import UpstoxClient
 from pnl_format import print_period_line, print_skip_line, print_summary
 
@@ -49,23 +33,32 @@ from adjustment_engine import AdjustmentEngine, AdjustmentRules, AdjustmentActio
 
 import live_data_source
 
+from exit_engine import TradeExitEngine
+from exit_engine.models import (
+    Trade, Position, Leg as ELeg, TradeContext,
+    TradeState, new_trade_id, new_position_id,
+)
+from exit_engine.audit import AuditLogger
+
+
+# ---------------------------------------------------------------------------
+# RunConfig
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RunConfig:
     strategy: str              # "iron_fly" | "strangle"
     mode: str                  # "backtest" | "forward_test" | "live"
-    timeframe: str              # "intraday" | "weekly" | "monthly"
-    date_from: Optional[str] = None   # None -> auto (fixed BACKTEST_WINDOW_DAYS window)
+    timeframe: str             # "intraday" | "weekly" | "monthly"
+    date_from: Optional[str] = None
     date_to: Optional[str] = None
-    capital: Optional[float] = None   # None -> auto (fixed ₹250,000)
+    capital: Optional[float] = None
     dry_run: bool = True
-    out_dir: Optional[str] = None     # None -> auto ("output")
+    out_dir: Optional[str] = None
     use_cache: bool = True
 
 
 def _resolve_defaults(config: RunConfig) -> RunConfig:
-    """Fills in the auto fields (#3/#4/#5) -- called once at the top of
-    run_session so every downstream function just sees concrete values."""
     sd = load_session_defaults()
     out_dir = config.out_dir or sd.output_dir
     capital = config.capital or sd.fixed_capital
@@ -74,21 +67,29 @@ def _resolve_defaults(config: RunConfig) -> RunConfig:
         today = date.today()
         date_from = (today - timedelta(days=sd.backtest_window_days)).strftime("%Y-%m-%d")
         date_to = today.strftime("%Y-%m-%d")
-        print(f"[CONFIG] Backtest window auto-set to fixed {sd.backtest_window_days}-day "
-              f"lookback: {date_from} .. {date_to} (change BACKTEST_WINDOW_DAYS in .env)")
-    return replace(config, out_dir=out_dir, capital=capital, date_from=date_from, date_to=date_to)
+        print(f"[CONFIG] Backtest window: {date_from} .. {date_to} "
+              f"({sd.backtest_window_days} days — change BACKTEST_WINDOW_DAYS in .env)")
+    return replace(config, out_dir=out_dir, capital=capital,
+                   date_from=date_from, date_to=date_to)
 
 
-def run_session(config: RunConfig):
-    config = _resolve_defaults(config)
-    os.makedirs(config.out_dir, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Exit engine factory
+# ---------------------------------------------------------------------------
 
-    if config.strategy == "iron_fly":
-        _run_iron_fly_session(config)
-    elif config.strategy == "strangle":
-        _run_strangle_session(config)
-    else:
-        raise ValueError(f"Unknown strategy '{config.strategy}'")
+def _build_exit_engine(strategy: str, timeframe: str, out_dir: str) -> TradeExitEngine:
+    """Loads the correct YAML policy for this strategy×timeframe and builds
+    a TradeExitEngine. Audit log goes to output/exit_engine_audit.jsonl."""
+    paths = load_exit_policy_paths()
+    key = f"{strategy}_{timeframe}"
+    policy_path = paths.get(key)
+    if policy_path is None or not os.path.isfile(policy_path):
+        raise FileNotFoundError(
+            f"Exit policy YAML not found for {key!r} (looked at {policy_path!r}). "
+            f"Check EXIT_POLICY_* keys in .env or add the missing file."
+        )
+    audit = AuditLogger(os.path.join(out_dir, "exit_engine_audit.jsonl"))
+    return TradeExitEngine.from_yaml(policy_path, audit_logger=audit)
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +113,7 @@ def _wednesdays_in_range(start: datetime, end: datetime):
         d += timedelta(days=7)
 
 
-def _monthly_cycles(start: datetime, end: datetime, get_monthly_expiry_dt, exit_days_before_expiry: int):
-    """Yields non-overlapping (entry_date, exit_date) Wednesday-start cycles.
-    get_monthly_expiry_dt(entry_date) -> datetime | None (None = can't
-    resolve, e.g. near the edge of Upstox's data window -> skip forward)."""
+def _monthly_cycles(start, end, get_monthly_expiry_dt, exit_days_before_expiry):
     d = start
     while d.weekday() != 2:
         d += timedelta(days=1)
@@ -137,6 +135,22 @@ def _monthly_cycles(start: datetime, end: datetime, get_monthly_expiry_dt, exit_
 
 
 # ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def run_session(config: RunConfig):
+    config = _resolve_defaults(config)
+    os.makedirs(config.out_dir, exist_ok=True)
+
+    if config.strategy == "iron_fly":
+        _run_iron_fly_session(config)
+    elif config.strategy == "strangle":
+        _run_strangle_session(config)
+    else:
+        raise ValueError(f"Unknown strategy '{config.strategy}'")
+
+
+# ---------------------------------------------------------------------------
 # IRON FLY / ATM IRON CONDOR
 # ---------------------------------------------------------------------------
 
@@ -149,7 +163,8 @@ def _run_iron_fly_session(config: RunConfig):
         _run_iron_fly_live(config, params, client)
         return
 
-    # ---- BACKTEST (real historical data, data_fetcher.py unchanged) ----
+    exit_eng = _build_exit_engine("iron_fly", config.timeframe, config.out_dir)
+
     fetch_day = data_fetcher.fetch_day_data
     fetch_swing = data_fetcher.fetch_swing_trade_data
     if config.use_cache:
@@ -158,7 +173,7 @@ def _run_iron_fly_session(config: RunConfig):
         fetch_swing = data_cache.cached_fetch_swing_trade_data
 
     start = datetime.strptime(config.date_from, "%Y-%m-%d")
-    end = datetime.strptime(config.date_to, "%Y-%m-%d")
+    end   = datetime.strptime(config.date_to,   "%Y-%m-%d")
 
     results, leg_records, period_word = [], [], "days"
 
@@ -167,7 +182,8 @@ def _run_iron_fly_session(config: RunConfig):
             try:
                 df = fetch_day(client, params, d)
                 qty = df.attrs.get("lot_size", params.lot_size) * params.lots
-                result = run_day(df, params, d, quantity_override=qty)
+                result = run_day(df, params, d, quantity_override=qty,
+                                  exit_engine=exit_eng)
             except Exception as e:
                 print_skip_line(str(d.date()), str(e))
                 continue
@@ -181,21 +197,22 @@ def _run_iron_fly_session(config: RunConfig):
             try:
                 df = fetch_swing(client, params, entry_date, exit_date)
                 qty = df.attrs.get("lot_size", params.lot_size) * params.lots
-                result = run_swing_trade(df, params, df.attrs["entry_dt"], df.attrs["exit_dt"],
-                                          quantity_override=qty)
+                result = run_swing_trade(df, params, df.attrs["entry_dt"],
+                                          df.attrs["exit_dt"], quantity_override=qty,
+                                          exit_engine=exit_eng)
             except Exception as e:
                 print_skip_line(label, str(e))
                 continue
-            _collect_ironfly_result(result, results, leg_records, label, entry_key="entry_date")
+            _collect_ironfly_result(result, results, leg_records, label,
+                                    entry_key="entry_date")
 
     elif config.timeframe == "monthly":
-        # FIX #6: genuinely different from weekly now -- non-overlapping
-        # cycles ending IRON_CONDOR_MONTHLY_EXIT_DAYS_BEFORE_EXPIRY days
-        # before that cycle's real monthly expiry, with its own (wider)
-        # SL/TP thresholds.
         period_word = "monthly cycles"
-        monthly_params = replace(params, strategy_sl_pct=params.resolved_monthly_sl_pct(),
-                                  strategy_tp_pct=params.resolved_monthly_tp_pct())
+        monthly_params = replace(
+            params,
+            strategy_sl_pct=params.resolved_monthly_sl_pct(),
+            strategy_tp_pct=params.resolved_monthly_tp_pct(),
+        )
 
         def get_monthly_expiry(entry_date):
             try:
@@ -204,49 +221,51 @@ def _run_iron_fly_session(config: RunConfig):
             except Exception:
                 return None
 
-        for entry_date, exit_date in _monthly_cycles(start, end, get_monthly_expiry,
-                                                       params.monthly_exit_days_before_expiry):
+        for entry_date, exit_date in _monthly_cycles(
+                start, end, get_monthly_expiry, params.monthly_exit_days_before_expiry):
             label = f"{entry_date.date()}->{exit_date.date()} (monthly)"
             try:
                 df = fetch_swing(client, monthly_params, entry_date, exit_date)
                 qty = df.attrs.get("lot_size", monthly_params.lot_size) * monthly_params.lots
-                result = run_swing_trade(df, monthly_params, df.attrs["entry_dt"], df.attrs["exit_dt"],
-                                          quantity_override=qty)
+                result = run_swing_trade(df, monthly_params, df.attrs["entry_dt"],
+                                          df.attrs["exit_dt"], quantity_override=qty,
+                                          exit_engine=exit_eng)
             except Exception as e:
                 print_skip_line(label, str(e))
                 continue
-            _collect_ironfly_result(result, results, leg_records, label, entry_key="entry_date")
+            _collect_ironfly_result(result, results, leg_records, label,
+                                    entry_key="entry_date")
     else:
         raise ValueError(f"Unknown timeframe '{config.timeframe}'")
 
-    _summarize_and_write(results, leg_records, config, title="IRON CONDOR / IRON FLY BACKTEST",
+    _summarize_and_write(results, leg_records, config,
+                          title="IRON CONDOR / IRON FLY BACKTEST",
                           period_word=period_word)
 
 
-def _collect_ironfly_result(result: dict, results: list, leg_records: list, label: str,
-                             entry_key: str = "date"):
+def _collect_ironfly_result(result: dict, results: list, leg_records: list,
+                             label: str, entry_key: str = "date"):
     if result.get("status") != "OK":
-        print_skip_line(label, result.get("status", "UNKNOWN"), tag=result.get("status", "SKIPPED"))
+        print_skip_line(label, result.get("status", "UNKNOWN"),
+                        tag=result.get("status", "SKIPPED"))
         return
     results.append({
-        "period": result.get(entry_key, label),
-        "net_credit": result["net_credit"],
+        "period":       result.get(entry_key, label),
+        "net_credit":   result["net_credit"],
         "close_reason": result["close_reason"],
-        "total_pnl": result["total_pnl"],
+        "total_pnl":    result["total_pnl"],
     })
     leg_records.extend(result["legs"])
     print_period_line(label, result["total_pnl"], result["close_reason"])
 
 
-def _run_iron_fly_live(config: RunConfig, params: StrategyParams, client: UpstoxClient):
-    """FIX #8: forward_test now runs THIS -- real live quotes, real strike/
-    expiry resolution, orders always simulated. live mode runs the identical
-    path with dry_run controlling whether orders are simulated or real."""
+def _run_iron_fly_live(config: RunConfig, params: StrategyParams,
+                        client: UpstoxClient):
     from strategy import IronFlyState
 
     paper = (config.mode == "forward_test") or config.dry_run
-    label = "FORWARD-TEST (paper, live market data)" if config.mode == "forward_test" \
-        else ("LIVE — DRY RUN (paper)" if paper else "LIVE — REAL ORDERS")
+    label = ("FORWARD-TEST (paper, live market data)" if config.mode == "forward_test"
+             else ("LIVE — DRY RUN (paper)" if paper else "LIVE — REAL ORDERS"))
     print(f"\n[IRON FLY / {config.timeframe.upper()}] {label}")
 
     try:
@@ -254,6 +273,9 @@ def _run_iron_fly_live(config: RunConfig, params: StrategyParams, client: Upstox
     except Exception as e:
         print(f"[ERROR] Could not resolve live legs: {e}")
         return
+
+    # Build exit engine for live mode too
+    exit_eng = _build_exit_engine("iron_fly", config.timeframe, config.out_dir)
 
     qty = snap["lot_size"] * params.lots
     state = IronFlyState(
@@ -266,20 +288,16 @@ def _run_iron_fly_live(config: RunConfig, params: StrategyParams, client: Upstox
     state.enter(entry_prices, snap["ts"])
     print(f"[ENTRY] net_credit={state.net_credit:.2f}  "
           f"legs={ {n: leg['strike'] for n, leg in snap['legs'].items()} }")
-    if not paper:
-        print("[LIVE ORDER] place_order() calls go here once you've watched "
-              "paper behavior and are deliberately ready -- intentionally not "
-              "auto-wired to real order placement in this build.")
 
+    from backtest_engine import _build_trade_context, _apply_decision
     exit_h, exit_m = map(int, params.exit_time.split(":"))
-    print(f"[MONITOR] Polling live LTP until {params.exit_time} or an SL/TP hit. "
-          f"Ctrl+C to stop early (position stays open on the broker).")
     import time as _time
+
     while not state.closed:
         now = datetime.now()
         if now.time() >= dtime(exit_h, exit_m):
             marks = _refetch_marks(client, snap["legs"])
-            state.on_tick(now, marks, force_exit=True, exit_reason="TIME_EXIT")
+            state.close_all(marks, "TIME_EXIT", now)
             break
         try:
             marks = _refetch_marks(client, snap["legs"])
@@ -287,36 +305,44 @@ def _run_iron_fly_live(config: RunConfig, params: StrategyParams, client: Upstox
             print(f"[WARN] live quote refresh failed, retrying: {e}")
             _time.sleep(5)
             continue
-        state.on_tick(now, marks)
+        ctx = _build_trade_context(state, marks, now, params.capital_deployed)
+        decision = exit_eng.evaluate_trade(ctx)
+        _apply_decision(state, decision, marks, now)
         _time.sleep(15)
 
-    print(f"[EXIT] reason={state.close_reason}  total_pnl={state.total_realized_pnl():.2f}")
+    print(f"[EXIT] reason={state.close_reason}  "
+          f"total_pnl={state.total_realized_pnl():.2f}")
 
 
 def _refetch_marks(client: UpstoxClient, legs: dict) -> dict:
     keys = [leg["instrument_key"] for leg in legs.values()]
     ltp_map = client.get_live_ltp(keys)
-    return {name: float(ltp_map.get(leg["instrument_key"], 0.0)) for name, leg in legs.items()}
+    return {name: float(ltp_map.get(leg["instrument_key"], 0.0))
+            for name, leg in legs.items()}
 
 
 # ---------------------------------------------------------------------------
-# HEDGED 25-DELTA STRANGLE
+# SHORT STRANGLE HEDGED
 # ---------------------------------------------------------------------------
 
 def _run_strangle_session(config: RunConfig):
     creds = load_upstox_creds()
-    tf_map = {"intraday": StrangleTimeframe.INTRADAY, "weekly": StrangleTimeframe.WEEKLY,
-              "monthly": StrangleTimeframe.MONTHLY}
+    tf_map = {"intraday": StrangleTimeframe.INTRADAY,
+              "weekly":   StrangleTimeframe.WEEKLY,
+              "monthly":  StrangleTimeframe.MONTHLY}
     params = load_strangle_params()
-    params = replace(params, timeframe=tf_map[config.timeframe], capital_deployed=config.capital)
+    params = replace(params, timeframe=tf_map[config.timeframe],
+                     capital_deployed=config.capital)
     client = UpstoxClient(creds)
 
     if config.mode in ("forward_test", "live"):
         _run_strangle_live(config, params, client)
         return
 
+    exit_eng = _build_exit_engine("strangle", config.timeframe, config.out_dir)
+
     start = datetime.strptime(config.date_from, "%Y-%m-%d")
-    end = datetime.strptime(config.date_to, "%Y-%m-%d")
+    end   = datetime.strptime(config.date_to,   "%Y-%m-%d")
 
     if config.timeframe == "monthly":
         def get_monthly_expiry(entry_date):
@@ -335,7 +361,8 @@ def _run_strangle_session(config: RunConfig):
     for entry_dt_raw, exit_dt_raw in entries:
         label = f"{entry_dt_raw.date()}->{exit_dt_raw.date()}"
         try:
-            result = _replay_strangle_cycle(client, params, entry_dt_raw, exit_dt_raw)
+            result = _replay_strangle_cycle(client, params, entry_dt_raw,
+                                             exit_dt_raw, exit_eng)
         except Exception as e:
             print_skip_line(label, str(e))
             continue
@@ -343,60 +370,127 @@ def _run_strangle_session(config: RunConfig):
             continue
         results.append(result["summary"])
         leg_records.extend(result["legs"])
-        print_period_line(label, result["summary"]["total_pnl"], result["summary"]["close_reason"])
+        print_period_line(label, result["summary"]["total_pnl"],
+                          result["summary"]["close_reason"])
 
-    _summarize_and_write(results, leg_records, config, title="HEDGED 25-DELTA STRANGLE BACKTEST",
+    _summarize_and_write(results, leg_records, config,
+                          title="SHORT STRANGLE HEDGED BACKTEST",
                           period_word=config.timeframe + " cycles")
 
 
+def _build_strangle_trade_context(state: StrangleState, marks: dict, ts,
+                                   capital_allocated: float) -> TradeContext:
+    """Builds a TradeContext from StrangleState for exit engine evaluation."""
+    position = Position(position_id=new_position_id())
+    for name in state.open_legs():
+        fill = state._open_fill(name)
+        if fill is None:
+            continue
+        elg = ELeg(
+            leg_id=name,
+            name=name,
+            side=fill.side.value,
+            quantity=fill.quantity,
+            entry_premium=fill.entry_price,
+            current_premium=marks.get(name, fill.entry_price),
+        )
+        position.legs[name] = elg
+
+    trade = Trade(
+        trade_id=new_trade_id(),
+        strategy_id="strangle",
+        position=position,
+        state=TradeState.ACTIVE,
+        entry_premium=state.net_credit,
+        capital_allocated=capital_allocated,
+    )
+    trade.realized_pnl = state.total_realized_pnl()
+    return TradeContext(trade=trade, leg_marks=marks, as_of=ts)
+
+
+def _apply_strangle_decision(state: StrangleState, decision, marks: dict, ts):
+    """Applies an exit engine Decision to a StrangleState."""
+    from exit_engine.models import ExitAction
+    if decision.continue_trade:
+        return
+    if not decision.leg_decisions or decision.close_entire_trade:
+        state.close_all(marks, decision.exit_reason.value, ts)
+        return
+    for ld in decision.leg_decisions:
+        if ld.action in (ExitAction.EXIT_LEG, ExitAction.CLOSE_ENTIRE_TRADE):
+            state.close_leg(ld.leg_id, marks.get(ld.leg_id, 0.0), ld.reason.value, ts)
+    if not state.open_legs():
+        state.closed = True
+        state.close_reason = decision.exit_reason.value
+
+
 def _replay_strangle_cycle(client: UpstoxClient, params: StrangleParams,
-                            entry_date: datetime, planned_exit_date: datetime) -> Optional[dict]:
+                            entry_date: datetime, planned_exit_date: datetime,
+                            exit_eng: TradeExitEngine) -> Optional[dict]:
     eh, em = map(int, params.entry_time.split(":"))
     xh, xm = map(int, params.exit_time.split(":"))
     entry_dt = entry_date.replace(hour=eh, minute=em)
 
     selector = HedgedDeltaStrangleSelector(
         short_leg_target_delta=params.short_leg_target_delta,
-        delta_tolerance=params.delta_tolerance, hedge_target_delta=params.hedge_target_delta,
-        fallback_points=params.hedge_fallback_points, r=params.risk_free_rate,
+        delta_tolerance=params.delta_tolerance,
+        hedge_target_delta=params.hedge_target_delta,
+        fallback_points=params.hedge_fallback_points,
+        r=params.risk_free_rate,
     )
 
     short_chain, hedge_chain = sdf.fetch_chain_at_datetime(
-        client, params.underlying, params.strike_step, entry_dt, strike_window=params.strike_window)
-    short_expiry, hedge_expiry = short_chain.expiry_date, hedge_chain.expiry_date
+        client, params.underlying, params.strike_step, entry_dt,
+        strike_window=params.strike_window,
+    )
+    short_expiry = short_chain.expiry_date
+    hedge_expiry = hedge_chain.expiry_date
 
     ce_short, pe_short = selector.select_short_legs(short_chain)
     ce_hedge, pe_hedge = selector.select_hedge_legs(hedge_chain, ce_short, pe_short)
 
     state = StrangleState(
-        quantity=params.quantity, strategy_sl_capital_pct=params.sl_capital_pct,
-        strategy_tp_capital_pct=params.tp_capital_pct, capital_deployed=params.capital_deployed,
-        sl_mode=params.sl_mode, trail_activate_pct=params.trail_activate_pct,
+        quantity=params.quantity,
+        strategy_sl_capital_pct=params.sl_capital_pct,
+        strategy_tp_capital_pct=params.tp_capital_pct,
+        capital_deployed=params.capital_deployed,
+        sl_mode=params.sl_mode,
+        trail_activate_pct=params.trail_activate_pct,
         trail_giveback_pct=params.trail_giveback_pct,
     )
-    state.enter({"ce_short": ce_short.premium, "pe_short": pe_short.premium,
-                 "ce_hedge": ce_hedge.premium, "pe_hedge": pe_hedge.premium}, entry_dt)
+    state.enter({
+        "ce_short": ce_short.premium, "pe_short": pe_short.premium,
+        "ce_hedge": ce_hedge.premium, "pe_hedge": pe_hedge.premium,
+    }, entry_dt)
+    # Stamp entry strikes so current_strikes() works immediately
     for name, sel in (("ce_short", ce_short), ("pe_short", pe_short),
                       ("ce_hedge", ce_hedge), ("pe_hedge", pe_hedge)):
         state.fills[name][0].strike = sel.strike
 
     adj_engine = None
     if params.adjustment_enabled:
-        rules = AdjustmentRules(delta_breach_threshold=params.adjustment_delta_breach,
-                                 no_new_roll_inside_dte=params.adjustment_no_roll_inside_dte,
-                                 max_adjustments_per_trade=params.adjustment_max_per_trade,
-                                 max_debit_pct_capital=params.adjustment_max_debit_pct_capital)
-        adj_engine = AdjustmentEngine(rules, selector, params.capital_deployed, r=params.risk_free_rate)
+        rules = AdjustmentRules(
+            delta_breach_threshold=params.adjustment_delta_breach,
+            no_new_roll_inside_dte=params.adjustment_no_roll_inside_dte,
+            max_adjustments_per_trade=params.adjustment_max_per_trade,
+            max_debit_pct_capital=params.adjustment_max_debit_pct_capital,
+        )
+        adj_engine = AdjustmentEngine(rules, selector, params.capital_deployed,
+                                       r=params.risk_free_rate)
 
-    exit_dt = planned_exit_date.replace(hour=xh, minute=xm) if params.timeframe != StrangleTimeframe.INTRADAY \
-        else entry_date.replace(hour=xh, minute=xm)
+    exit_dt = (planned_exit_date.replace(hour=xh, minute=xm)
+               if params.timeframe != StrangleTimeframe.INTRADAY
+               else entry_date.replace(hour=xh, minute=xm))
 
     cur = entry_dt + timedelta(minutes=params.replay_interval_mins)
+
     while cur <= exit_dt and not state.closed:
         try:
-            sc, hc = sdf.fetch_chain_at_datetime(client, params.underlying, params.strike_step, cur,
-                                                  short_expiry=short_expiry, hedge_expiry=hedge_expiry,
-                                                  strike_window=params.strike_window)
+            sc, hc = sdf.fetch_chain_at_datetime(
+                client, params.underlying, params.strike_step, cur,
+                short_expiry=short_expiry, hedge_expiry=hedge_expiry,
+                strike_window=params.strike_window,
+            )
         except Exception:
             cur += timedelta(minutes=params.replay_interval_mins)
             continue
@@ -409,37 +503,49 @@ def _replay_strangle_cycle(client: UpstoxClient, params: StrangleParams,
         for name in ("ce_hedge", "pe_hedge"):
             row = next((r for r in hc.rows if r.strike == strikes[name]), None)
             marks[name] = (row.ce_premium if "ce" in name else row.pe_premium) if row else None
+
         if any(v is None for v in marks.values()):
             cur += timedelta(minutes=params.replay_interval_mins)
             continue
 
         force = cur >= exit_dt
-        state.on_tick(cur, marks, force_exit=force, exit_reason="TIME_EXIT" if force else None)
+        if force:
+            state.close_all(marks, "TIME_EXIT", cur)
+        else:
+            ctx = _build_strangle_trade_context(state, marks, cur,
+                                                  params.capital_deployed)
+            decision = exit_eng.evaluate_trade(ctx)
+            _apply_strangle_decision(state, decision, marks, cur)
 
+        # Adjustment engine (monthly only) — runs AFTER the combined SL/TP check
         if adj_engine is not None and not state.closed:
+            strikes = state.current_strikes()
             dte = (datetime.strptime(short_expiry, "%Y-%m-%d") - cur).total_seconds() / 86400.0
-            trig = adj_engine.check_triggers(state, sc, strikes["ce_short"], strikes["pe_short"], dte)
+            trig = adj_engine.check_triggers(
+                state, sc, strikes["ce_short"], strikes["pe_short"], dte)
             action = adj_engine.next_action(state, trig)
             if action == AdjustmentAction.REDUCE_OR_CLOSE:
-                for name in state.open_legs():
-                    state.close_leg(name, marks[name], "ADJUSTMENT_REDUCE_CLOSE", cur)
-                state.closed = True
-                state.close_reason = "ADJUSTMENT_REDUCE_CLOSE"
+                state.close_all(marks, "ADJUSTMENT_REDUCE_CLOSE", cur)
             elif action != AdjustmentAction.NONE:
                 tested = "ce" if trig.ce_breached else "pe"
-                outcome = adj_engine.execute_adjustment(action, state, sc, hc, tested, cur)
+                outcome = adj_engine.execute_adjustment(
+                    action, state, sc, hc, tested, cur)
                 if outcome.get("status") == "ROLL":
-                    state.roll_leg(outcome["short_leg_name"], marks[outcome["short_leg_name"]],
-                                    outcome["short"].strike, outcome["short"].premium, action.value, cur)
-                    state.roll_leg(outcome["hedge_leg_name"], marks[outcome["hedge_leg_name"]],
-                                    outcome["hedge"].strike, outcome["hedge"].premium, action.value, cur)
+                    state.roll_leg(outcome["short_leg_name"],
+                                   marks[outcome["short_leg_name"]],
+                                   outcome["short"].strike, outcome["short"].premium,
+                                   action.value, cur)
+                    state.roll_leg(outcome["hedge_leg_name"],
+                                   marks[outcome["hedge_leg_name"]],
+                                   outcome["hedge"].strike, outcome["hedge"].premium,
+                                   action.value, cur)
 
         cur += timedelta(minutes=params.replay_interval_mins)
 
+    # Final force-close if still open at end of data
     if not state.closed:
         strikes = state.current_strikes()
-        marks = {}
-        ok = True
+        marks, ok = {}, True
         for name in ("ce_short", "pe_short"):
             row = next((r for r in short_chain.rows if r.strike == strikes[name]), None)
             if row is None:
@@ -453,7 +559,7 @@ def _replay_strangle_cycle(client: UpstoxClient, params: StrangleParams,
                 break
             marks[name] = row.ce_premium if "ce" in name else row.pe_premium
         if ok:
-            state.on_tick(exit_dt, marks, force_exit=True, exit_reason="DATA_END")
+            state.close_all(marks, "DATA_END", exit_dt)
         else:
             return None
 
@@ -461,86 +567,108 @@ def _replay_strangle_cycle(client: UpstoxClient, params: StrangleParams,
     for name in state.fills:
         for f in state.fills[name]:
             leg_rows.append({
-                "entry_date": entry_dt.date().isoformat(), "leg": name, "strike": f.strike,
-                "side": f.side.value, "qty": f.quantity, "entry_price": f.entry_price,
-                "exit_price": f.exit_price, "exit_reason": f.exit_reason,
-                "leg_pnl": f.realized_pnl(),
+                "entry_date":  entry_dt.date().isoformat(),
+                "leg":         name,
+                "strike":      f.strike,
+                "side":        f.side.value,
+                "qty":         f.quantity,
+                "entry_price": f.entry_price,
+                "exit_price":  f.exit_price,
+                "exit_reason": f.exit_reason,
+                "leg_pnl":     f.realized_pnl(),
             })
 
     return {
-        "summary": {"period": entry_dt.date().isoformat(), "net_credit": state.net_credit,
-                    "close_reason": state.close_reason, "total_pnl": state.total_realized_pnl(),
-                    "adjustments": state.adjustment_count},
+        "summary": {
+            "period":       entry_dt.date().isoformat(),
+            "net_credit":   state.net_credit,
+            "close_reason": state.close_reason,
+            "total_pnl":    state.total_realized_pnl(),
+            "adjustments":  state.adjustment_count,
+        },
         "legs": leg_rows,
     }
 
 
-def _run_strangle_live(config: RunConfig, params: StrangleParams, client: UpstoxClient):
-    """FIX #8: forward_test runs this too now (paper=True forced), against
-    REAL live option-chain quotes via strangle_data_fetcher.fetch_live_chain
-    -- not a historical replay."""
+def _run_strangle_live(config: RunConfig, params: StrangleParams,
+                        client: UpstoxClient):
     paper = (config.mode == "forward_test") or config.dry_run
-    label = "FORWARD-TEST (paper, live market data)" if config.mode == "forward_test" \
-        else ("LIVE — DRY RUN (paper)" if paper else "LIVE — REAL ORDERS")
+    label = ("FORWARD-TEST (paper, live market data)" if config.mode == "forward_test"
+             else ("LIVE — DRY RUN (paper)" if paper else "LIVE — REAL ORDERS"))
     print(f"\n[STRANGLE / {config.timeframe.upper()}] {label}")
 
+    exit_eng = _build_exit_engine("strangle", config.timeframe, config.out_dir)
+
     selector = HedgedDeltaStrangleSelector(
-        short_leg_target_delta=params.short_leg_target_delta, delta_tolerance=params.delta_tolerance,
-        hedge_target_delta=params.hedge_target_delta, fallback_points=params.hedge_fallback_points,
+        short_leg_target_delta=params.short_leg_target_delta,
+        delta_tolerance=params.delta_tolerance,
+        hedge_target_delta=params.hedge_target_delta,
+        fallback_points=params.hedge_fallback_points,
         r=params.risk_free_rate,
     )
 
     try:
-        short_expiry, hedge_expiry = sdf.resolve_live_expiries(client, params.underlying, datetime.now())
-        short_chain, hedge_chain = sdf.fetch_live_chain(client, params.underlying, params.strike_step,
-                                                          short_expiry, hedge_expiry,
-                                                          strike_window=params.strike_window)
+        short_expiry, hedge_expiry = sdf.resolve_live_expiries(
+            client, params.underlying, datetime.now())
+        short_chain, hedge_chain = sdf.fetch_live_chain(
+            client, params.underlying, params.strike_step,
+            short_expiry, hedge_expiry, strike_window=params.strike_window)
         ce_short, pe_short = selector.select_short_legs(short_chain)
         ce_hedge, pe_hedge = selector.select_hedge_legs(hedge_chain, ce_short, pe_short)
     except Exception as e:
         print(f"[ERROR] Could not resolve live strangle legs: {e}")
         return
 
+    now = datetime.now()
     state = StrangleState(
-        quantity=params.quantity, strategy_sl_capital_pct=params.sl_capital_pct,
-        strategy_tp_capital_pct=params.tp_capital_pct, capital_deployed=params.capital_deployed,
-        sl_mode=params.sl_mode, trail_activate_pct=params.trail_activate_pct,
+        quantity=params.quantity,
+        strategy_sl_capital_pct=params.sl_capital_pct,
+        strategy_tp_capital_pct=params.tp_capital_pct,
+        capital_deployed=params.capital_deployed,
+        sl_mode=params.sl_mode,
+        trail_activate_pct=params.trail_activate_pct,
         trail_giveback_pct=params.trail_giveback_pct,
     )
-    now = datetime.now()
-    state.enter({"ce_short": ce_short.premium, "pe_short": pe_short.premium,
-                 "ce_hedge": ce_hedge.premium, "pe_hedge": pe_hedge.premium}, now)
+    state.enter({
+        "ce_short": ce_short.premium, "pe_short": pe_short.premium,
+        "ce_hedge": ce_hedge.premium, "pe_hedge": pe_hedge.premium,
+    }, now)
     for name, sel in (("ce_short", ce_short), ("pe_short", pe_short),
                       ("ce_hedge", ce_hedge), ("pe_hedge", pe_hedge)):
         state.fills[name][0].strike = sel.strike
 
     print(f"[ENTRY] net_credit={state.net_credit:.2f}  "
           f"strikes={ {n: f[0].strike for n, f in state.fills.items()} }")
-    if not paper:
-        print("[LIVE ORDER] place_order() calls go here once ready -- not auto-wired in this build.")
 
     xh, xm = map(int, params.exit_time.split(":"))
     import time as _time
+
     while not state.closed:
         n = datetime.now()
         if n.time() >= dtime(xh, xm):
-            sc, hc = sdf.fetch_live_chain(client, params.underlying, params.strike_step,
-                                           short_expiry, hedge_expiry, strike_window=params.strike_window)
+            sc, hc = sdf.fetch_live_chain(
+                client, params.underlying, params.strike_step,
+                short_expiry, hedge_expiry, strike_window=params.strike_window)
             marks = _live_marks(state, sc, hc)
-            state.on_tick(n, marks, force_exit=True, exit_reason="TIME_EXIT")
+            state.close_all(marks, "TIME_EXIT", n)
             break
         try:
-            sc, hc = sdf.fetch_live_chain(client, params.underlying, params.strike_step,
-                                           short_expiry, hedge_expiry, strike_window=params.strike_window)
+            sc, hc = sdf.fetch_live_chain(
+                client, params.underlying, params.strike_step,
+                short_expiry, hedge_expiry, strike_window=params.strike_window)
             marks = _live_marks(state, sc, hc)
         except Exception as e:
             print(f"[WARN] live chain refresh failed, retrying: {e}")
             _time.sleep(10)
             continue
-        state.on_tick(n, marks)
+
+        ctx = _build_strangle_trade_context(state, marks, n, params.capital_deployed)
+        decision = exit_eng.evaluate_trade(ctx)
+        _apply_strangle_decision(state, decision, marks, n)
         _time.sleep(30)
 
-    print(f"[EXIT] reason={state.close_reason}  total_pnl={state.total_realized_pnl():.2f}")
+    print(f"[EXIT] reason={state.close_reason}  "
+          f"total_pnl={state.total_realized_pnl():.2f}")
 
 
 def _live_marks(state: StrangleState, short_chain, hedge_chain) -> dict:
@@ -567,18 +695,23 @@ def _summarize_and_write(results: list, leg_records: list, config: RunConfig,
     df = pd.DataFrame(results)
     legs_df = pd.DataFrame(leg_records)
 
-    out_csv = os.path.join(config.out_dir, f"{config.strategy}_{config.timeframe}_trades.csv")
+    out_csv = os.path.join(config.out_dir,
+                            f"{config.strategy}_{config.timeframe}_trades.csv")
     df.to_csv(out_csv, index=False)
     legs_df.to_csv(out_csv.replace(".csv", "_legs.csv"), index=False)
 
     total_pnl = df["total_pnl"].sum()
-    win = (df["total_pnl"] > 0).sum()
-    loss = (df["total_pnl"] <= 0).sum()
-    win_rate = win / len(df) * 100
-    equity = df["total_pnl"].cumsum()
-    max_dd = (equity - equity.cummax()).min()
+    win       = (df["total_pnl"] > 0).sum()
+    loss      = (df["total_pnl"] <= 0).sum()
+    win_rate  = win / len(df) * 100
+    equity    = df["total_pnl"].cumsum()
+    max_dd    = (equity - equity.cummax()).min()
 
-    print_summary(title=title, rows=df, total_pnl=total_pnl, max_dd=max_dd, win_rate=win_rate,
-                  avg_pnl=df["total_pnl"].mean(), n_win=win, n_loss=loss, capital=config.capital,
-                  close_reason_counts=df["close_reason"].value_counts(), period_word=period_word)
-    print(f"\nDetailed logs written to {out_csv} and {out_csv.replace('.csv', '_legs.csv')}")
+    print_summary(
+        title=title, rows=df, total_pnl=total_pnl, max_dd=max_dd,
+        win_rate=win_rate, avg_pnl=df["total_pnl"].mean(),
+        n_win=win, n_loss=loss, capital=config.capital,
+        close_reason_counts=df["close_reason"].value_counts(),
+        period_word=period_word,
+    )
+    print(f"\nDetailed logs: {out_csv}  |  legs: {out_csv.replace('.csv', '_legs.csv')}")

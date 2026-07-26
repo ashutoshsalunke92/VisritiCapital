@@ -1,0 +1,39 @@
+# Iron Fly / ATM Iron Condor — Exit Policy
+# Mirrors the original strategy.py IronFlyState exit rules, now fully config-driven.
+#
+# Trade-level: combined SL = 25% of net credit, TP = 25% of net credit.
+# Leg-level:   per-leg SL = 25% adverse move on entry premium, SHORT legs only.
+#              Hedge legs (ce_otm7, pe_otm7) are EXCLUDED — they ride to time exit.
+#
+# To switch to TRAILING mode: set trailing_enabled: true and supply
+# trail_activate_value (fraction of net_credit at which trailing arms) and
+# trail_giveback_pct (fraction of peak profit allowed to give back before exit).
+# SL_MODE=TRAILING in .env also sets this at load time (see config.py).
+
+trade_level:
+  enabled: true
+  threshold:
+    trigger_source: LIVE_PNL
+    exit_type: PERCENTAGE
+    basis_source: ENTRY_PREMIUM     # net credit collected = entry premium for the structure
+    sl_value: 0.25                  # exit if combined PnL drops below -25% of net credit
+    tp_value: 0.25                  # exit if combined PnL reaches +25% of net credit
+    trailing_enabled: false
+    trail_activate_value: 0.125     # arm trailing once PnL >= 12.5% of net credit (50% of TP)
+    trail_giveback_pct: 0.30        # exit when PnL pulls back 30% from its peak
+
+leg_level:
+  enabled: true
+  threshold:
+    trigger_source: LIVE_PNL
+    exit_type: PERCENTAGE
+    basis_source: ENTRY_PREMIUM     # per-leg: % of that leg's own entry premium
+    sl_value: 0.25                  # exit a short leg if it loses 25% of entry premium
+    tp_value: null                  # no per-leg TP (only trade-level TP)
+    trailing_enabled: false
+  on_sl_action: EXIT_LEG
+  on_tp_action: EXIT_LEG
+  close_entire_trade_on_trigger: false  # only close the triggered leg, not the whole trade
+  excluded_leg_names:
+    - ce_otm7                       # hedge legs never per-leg stopped out
+    - pe_otm7
